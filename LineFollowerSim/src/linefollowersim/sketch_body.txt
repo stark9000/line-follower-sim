@@ -1,0 +1,342 @@
+// ---------------- motor driver
+%DRIVER%
+// mm/s -> signed PWM (-255..255), with the motor trim and optional dead-band lift
+int toPwm(float speed, float trim, int dead) {
+  float d = speed / TOP_SPEED * trim;
+  if (d > 1) d = 1;
+  if (d < -1) d = -1;
+  int p = (int) (d * 255.0f + (d >= 0 ? 0.5f : -0.5f));
+  if (DEAD_BAND_COMP && p != 0) p = (p > 0 ? 1 : -1) * (dead + (long) abs(p) * (255 - dead) / 255);
+  return p;
+}
+
+// ---------------- sensors
+// every reading is turned into 0..1023 with LOW = line, HIGH = floor (like the simulator's ADC)
+float whiteLevel[ROWS][N], blackLevel[ROWS][N], thresholdLevel[ROWS][N];
+float rawIn[ROWS][N];            // readings of this loop (0-1023)
+float filt[ROWS][N];             // after the filter
+float sDark[ROWS][N];            // darkness 0..1 (analog) or 0 / 1 (digital)
+#if FILTER == 1
+float maBuf[ROWS][N][16];
+uint8_t maPos = 0, maCnt = 0;
+#endif
+bool lpInit = false;
+bool hystDark[ROWS][N];          // comparator state (hysteresis)
+float hystLevel = HYST_LEVEL;    // readings must pass the threshold by this much to flip
+
+int readRaw(uint8_t r, uint8_t i) {
+  uint8_t pin = SENSOR_PIN[r][i];
+  if (DIGITAL_PINS) return digitalRead(pin) == DIGITAL_ON_LINE ? 0 : 1023;
+#if defined(ESP32) || defined(ARDUINO_ARCH_STM32)
+  int v = analogRead(pin) >> 2;                 // 12-bit -> 10-bit
+#else
+  int v = analogRead(pin);                      // AVR, ESP8266 (A0 only!), RP2040: 10-bit
+#endif
+  return LINE_READS_LOW ? v : 1023 - v;
+}
+
+void readSensors() {
+  for (uint8_t r = 0; r < ROWS; r++)
+    for (uint8_t i = 0; i < N; i++) rawIn[r][i] = readRaw(r, i);
+}
+
+// filter + calibration, exactly as the simulator does it (dts = seconds since the last reading)
+void processSensors(float dts) {
+#if FILTER == 1
+  uint8_t pos = maPos, cnt;
+  maPos = (maPos + 1) % 16;
+  if (maCnt < 16) maCnt++;
+  cnt = FILTER_N < maCnt ? FILTER_N : maCnt;
+#endif
+  float a = FILTER_TAU_S + dts > 0 ? dts / (FILTER_TAU_S + dts) : 1;
+  for (uint8_t r = 0; r < ROWS; r++) {
+    for (uint8_t i = 0; i < N; i++) {
+      float v = rawIn[r][i];
+#if FILTER == 1
+      maBuf[r][i][pos] = v;
+      float s = 0;
+      for (uint8_t k = 0; k < cnt; k++) s += maBuf[r][i][(pos - k + 32) % 16];
+      v = s / cnt;
+#elif FILTER == 2
+      if (!lpInit) filt[r][i] = v; else filt[r][i] += a * (v - filt[r][i]);
+      v = filt[r][i];
+#endif
+      filt[r][i] = v;
+      if (ANALOG_MODE) {
+        float span = whiteLevel[r][i] - blackLevel[r][i];
+        float d = span < 5 ? 0 : (whiteLevel[r][i] - v) / span;
+        sDark[r][i] = d < 0 ? 0 : (d > 1 ? 1 : d);
+      } else if (hystLevel > 0) {                 // comparator with hysteresis: keeps its state near the threshold
+        hystDark[r][i] = hystDark[r][i] ? v < thresholdLevel[r][i] + hystLevel : v < thresholdLevel[r][i] - hystLevel;
+        sDark[r][i] = hystDark[r][i] ? 1 : 0;
+      } else {
+        sDark[r][i] = v < thresholdLevel[r][i] ? 1 : 0;
+      }
+    }
+  }
+  lpInit = true;
+}
+
+// the levels the simulator calibrated (used when the start-up calibration is off)
+void useSimCalibration() {
+  for (uint8_t r = 0; r < ROWS; r++)
+    for (uint8_t i = 0; i < N; i++) {
+      whiteLevel[r][i] = SIM_WHITE[r][i];
+      blackLevel[r][i] = SIM_BLACK[r][i];
+      thresholdLevel[r][i] = SIM_THR[r][i];
+    }
+}
+
+void calibrate() {
+  useSimCalibration();
+  if (DIGITAL_PINS) {                            // modules decide themselves: fixed levels
+    for (uint8_t r = 0; r < ROWS; r++)
+      for (uint8_t i = 0; i < N; i++) { whiteLevel[r][i] = 1023; blackLevel[r][i] = 0; thresholdLevel[r][i] = 511.5f; }
+    return;
+  }
+  if (!%SPIN% || STEERING) return;              // a car cannot spin on the spot
+  for (uint8_t r = 0; r < ROWS; r++)
+    for (uint8_t i = 0; i < N; i++) { whiteLevel[r][i] = 0; blackLevel[r][i] = 1023; }
+  // spin on the spot over the line so every sensor sees both black and white
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3000) {
+    bool back = ((millis() - t0) / 750) % 2 == 1;
+    setMotors(back ? 90 : -90, back ? -90 : 90);
+    readSensors();
+    for (uint8_t r = 0; r < ROWS; r++)
+      for (uint8_t i = 0; i < N; i++) {
+        if (rawIn[r][i] > whiteLevel[r][i]) whiteLevel[r][i] = rawIn[r][i];
+        if (rawIn[r][i] < blackLevel[r][i]) blackLevel[r][i] = rawIn[r][i];
+      }
+  }
+  setMotors(0, 0);
+  float span = 0;
+  for (uint8_t r = 0; r < ROWS; r++)
+    for (uint8_t i = 0; i < N; i++) {
+      thresholdLevel[r][i] = (whiteLevel[r][i] + blackLevel[r][i]) / 2;
+      span += whiteLevel[r][i] - blackLevel[r][i];
+    }
+  if (HYST_LEVEL > 0) hystLevel = HYST_PCT / 100.0f * span / (ROWS * N) / 2;
+}
+
+// ---------------- line position of one row (mm, + = line to the right); NAN = no line
+bool junctionNow = false;
+
+float rowPosition(uint8_t r) {
+  if (r == 0) junctionNow = false;
+  float sum = 0, sumW = 0;
+  int first = -1, last = -1, cnt = 0;
+  for (uint8_t i = 0; i < N; i++) {
+    float d = sDark[r][i];
+    sum += d;
+    sumW += d * SENSOR_Y[i];
+    if (d > 0.5f) { cnt++; if (first < 0) first = i; last = i; }
+  }
+  if (!(sum > (ANALOG_MODE ? 0.2f : 0.5f))) return NAN;
+  if (JUNCTION != 0 && cnt >= 2) {               // a fork: two separate lines under the array
+    int gap = -1;
+    for (int i = first + 1; i < last; i++) if (sDark[r][i] <= 0.5f) { gap = i; break; }
+    if (gap > 0) {
+      int lo = JUNCTION == 1 ? 0 : gap, hi = JUNCTION == 1 ? gap : N;
+      if (JUNCTION == 2) for (int i = last - 1; i > first; i--) if (sDark[r][i] <= 0.5f) { lo = i + 1; break; }
+      float gs = 0, gw = 0;
+      for (int i = lo; i < hi; i++) { gs += sDark[r][i]; gw += sDark[r][i] * SENSOR_Y[i]; }
+      if (gs > 0) return ERROR_MODE == 1 ? gw : gw / gs;
+    }
+  }
+  int wide = (int) ceil(0.6 * N);
+  if (JUNCTION != 0 && cnt >= (wide > 3 ? wide : 3) && (first == 0 || last == N - 1)) {
+    if (r == 0) junctionNow = true;
+    return SENSOR_Y[JUNCTION == 1 ? first : last];   // crossing / T: lean to the chosen side
+  }
+  return ERROR_MODE == 1 ? sumW : sumW / sum;
+}
+
+// ---------------- controller (the simulator's, line by line)
+float error = 0, prevError = 0, lastValid = 0, integral = 0, dFilt = 0;
+float pTerm, iTerm, dTerm, out;
+bool firstLoop = true, lineVisible = true;
+int seenCount = 0;
+float nowS = 0, lostSince = 0;
+float vBody = 0;                 // robot speed, mm/s: here the last speed asked (no encoders)
+float outL = 0, outR = 0, steerDeg = 0;   // results: wheel speeds (mm/s) and steering angle (deg)
+
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static float sgn(float v) { return (float) ((v > 0) - (v < 0)); }
+
+void controlStep(float cdt) {
+  float halfSpan = HALF_SPAN;
+  float e0 = rowPosition(0);
+  bool seen = !isnan(e0);
+  seenCount = seen ? seenCount + 1 : 0;
+  bool accept = seen && (lineVisible || seenCount >= (CONFIRM < 1 ? 1 : CONFIRM));
+  bool changed = accept != lineVisible;
+  bool spin = false, stop = false;
+  if (accept) {
+    error = e0;
+    if (ROWS >= 2 && ROW_SPACING > 0) {          // line direction from the front and the rear row
+      float eb = rowPosition(ROWS - 1);
+      if (!isnan(eb)) error = e0 + (e0 - eb) / ((ROWS - 1) * ROW_SPACING) * PREDICT_AHEAD_MM;
+    }
+    lineVisible = true;
+    lastValid = error;
+  } else {
+    if (lineVisible) lostSince = nowS;
+    lineVisible = false;
+    float hard = sgn(lastValid) * (halfSpan + PITCH_MM);
+    switch (LOST_MODE) {
+      case 1: error = lastValid; break;                         // hold the last error
+      case 2: error = hard; break;                              // steer hard to the last side
+      case 4: error = hard; spin = true; break;                 // spin towards the last side
+      case 3: error = 0; break;                                 // straight on
+      case 5: error = 0; stop = true; break;                    // stop
+      default:                                                  // smart: left at the edge -> steer hard, gap -> straight
+        error = ERROR_MODE == 1 ? 0 : (fabs(lastValid) > halfSpan * EDGE_ZONE ? hard : 0);
+    }
+    if (LOST_TIMEOUT_S > 0 && nowS - lostSince > LOST_TIMEOUT_S) stop = true;
+  }
+  float dRaw = (firstLoop || (NO_D_KICK && changed)) ? 0 : (error - prevError) / cdt;
+  firstLoop = false;
+  dFilt += (dRaw - dFilt) * (cdt / (D_FILTER_S + cdt));
+  prevError = error;
+  integral += error * cdt;
+  float iLim = KI > 1e-9f ? TOP_SPEED * 0.5f / KI : 0;       // anti-windup
+  integral = clampf(integral, -iLim, iLim);
+  pTerm = KP * (error + dFilt * PREDICT_S);
+  iTerm = KI * integral;
+  dTerm = KD * dFilt;
+  out = clampf(pTerm + iTerm + dTerm, -TOP_SPEED, TOP_SPEED);
+
+  float edge = halfSpan + PITCH_MM > 1 ? halfSpan + PITCH_MM : 1;
+  float e = fabs(error) / edge;
+  float speed = BASE_SPEED * (1 - CORNER_SLOW * (e > 1 ? 1 : e));
+  float lo = ALLOW_REVERSE ? -TOP_SPEED : 0;
+  float lock = clampf(MAX_STEER_DEG, 1, 60);
+  if (stop) {
+    outL = outR = 0;
+    steerDeg = 0;
+  } else if (spin) {
+    float sp = fabs(SEARCH_SPEED) < TOP_SPEED ? fabs(SEARCH_SPEED) : TOP_SPEED, dir = lastValid >= 0 ? 1 : -1;
+    if (STEERING) { steerDeg = dir * lock; outL = outR = sp; }   // a car cannot spin: full lock, crawl
+    else { outL = dir * sp; outR = -dir * sp; }
+  } else if (STEERING) {
+    // the same PID output asks for the turn rate a two-wheel robot would get (2 * out / track)
+    float wDes = 2 * out / (WHEEL_BASE > 1 ? WHEEL_BASE : 1);
+    float vRef = speed > fabs(vBody) ? speed : fabs(vBody);
+    if (vRef < 50) vRef = 50;
+    steerDeg = clampf(atan(wDes * (AXLE_SPACING > 10 ? AXLE_SPACING : 10) / vRef) * 57.29578f, -lock, lock);
+    outL = outR = clampf(speed, lo, TOP_SPEED);
+  } else {
+    outL = clampf(speed + out, lo, TOP_SPEED);
+    outR = clampf(speed - out, lo, TOP_SPEED);
+  }
+}
+
+#if ENCODERS
+// ---------------- wheel encoders (channel A of each on an interrupt pin, both edges) and the speed loop
+volatile long encL = 0, encR = 0;
+long encLastL = 0, encLastR = 0;
+float encIntL = 0, encIntR = 0, encSpeedL = 0, encSpeedR = 0;
+void isrL() { encL += outL >= 0 ? 1 : -1; }      // one channel: the direction comes from the command
+void isrR() { encR += outR >= 0 ? 1 : -1; }
+
+void speedLoop(float dt) {
+  noInterrupts();
+  long cl = encL, cr = encR;
+  interrupts();
+  encSpeedL = (cl - encLastL) * MM_PER_COUNT / dt;
+  encSpeedR = (cr - encLastR) * MM_PER_COUNT / dt;
+  encLastL = cl;
+  encLastR = cr;
+  if (!SPEED_LOOP || (outL == 0 && outR == 0)) return;
+  float eL = outL - encSpeedL, eR = outR - encSpeedR, lim = TOP_SPEED * 0.5f / (SPEED_KI > 1e-6f ? SPEED_KI : 1e-6f);
+  encIntL = clampf(encIntL + eL * dt, -lim, lim);
+  encIntR = clampf(encIntR + eR * dt, -lim, lim);
+  float lo = ALLOW_REVERSE || CODE_MODE == 2 ? -TOP_SPEED : 0;
+  outL = clampf(outL + SPEED_KP * eL + SPEED_KI * encIntL, lo, TOP_SPEED);
+  outR = clampf(outR + SPEED_KP * eR + SPEED_KI * encIntR, lo, TOP_SPEED);
+}
+#endif
+
+void applyOutputs() {
+#if STEERING
+#if STEER_DC
+  // a DC steering motor: full lock one way or the other, or let the spring centre it
+  float lk = clampf(MAX_STEER_DEG, 1, 60);
+  int sd = SERVO_DIR * (steerDeg > 0.3f * lk ? 1 : (steerDeg < -0.3f * lk ? -1 : 0));
+  digitalWrite(S_IN1, sd > 0 ? HIGH : LOW);
+  digitalWrite(S_IN2, sd < 0 ? HIGH : LOW);
+  analogWrite(S_PWM, sd != 0 ? 255 : 0);
+#else
+  steering.write((int) (SERVO_CENTER + SERVO_DIR * steerDeg + (steerDeg >= 0 ? 0.5f : -0.5f)));
+#endif
+#endif
+  setMotors(toPwm(outL, TRIM_L, DEAD_PWM_L), toPwm(outR, TRIM_R, DEAD_PWM_R));
+  vBody = (outL + outR) / 2;
+}
+
+%CODE%
+// ---------------- main
+unsigned long nextLoop, lastLoop, loopNo = 0;
+
+#ifndef LFS_NO_MAIN
+void setup() {
+#if LOG || CODE_MODE
+  Serial.begin(115200);
+#endif
+  driverBegin();
+#if STEERING && !STEER_DC
+  steering.attach(SERVO_PIN);
+  steering.write(SERVO_CENTER);
+#elif STEER_DC
+  pinMode(S_PWM, OUTPUT); pinMode(S_IN1, OUTPUT); pinMode(S_IN2, OUTPUT);
+#endif
+  setMotors(0, 0);
+  for (uint8_t r = 0; r < ROWS; r++)
+    for (uint8_t i = 0; i < N; i++) pinMode(SENSOR_PIN[r][i], INPUT);
+#if ENCODERS
+  pinMode(ENC_L, INPUT_PULLUP);
+  pinMode(ENC_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L), isrL, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R), isrR, CHANGE);
+#endif
+  delay(%START%);                                // time to put the robot on the line
+  calibrate();
+  delay(500);
+#if LOG
+  Serial.println("LOG,t_ms,error_mm,cmd_left,cmd_right,line_seen");   // File > Import a run log reads this
+#endif
+#if CODE_MODE
+  user::userSetup();
+#endif
+  nextLoop = lastLoop = micros();
+}
+
+void loop() {
+  while ((long) (micros() - nextLoop) < 0) { }   // fixed loop period, like the simulator
+  nextLoop += LOOP_US;
+  unsigned long now = micros();
+  float dt = (now - lastLoop) / 1e6f;
+  lastLoop = now;
+  if (dt <= 0 || dt > 0.1f) dt = LOOP_US / 1e6f;
+  nowS = now / 1e6f;
+  readSensors();
+  processSensors(dt);
+#if CODE_MODE
+  codeStep(dt);                                  // your code from the Code tab
+#else
+  controlStep(dt);
+#endif
+#if ENCODERS
+  speedLoop(dt);
+#endif
+  applyOutputs();
+#if LOG
+  if (++loopNo % LOG_EVERY == 0) {               // keep the serial line short: it takes loop time
+    Serial.print("LOG,"); Serial.print(millis()); Serial.print(',');
+    Serial.print(error, 1); Serial.print(','); Serial.print(outL, 0); Serial.print(',');
+    Serial.print(outR, 0); Serial.print(','); Serial.println(lineVisible ? 1 : 0);
+  }
+#endif
+}
+#endif
